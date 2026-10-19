@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Text,
     Index,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -596,3 +597,73 @@ class StockConsumptionRecord(Base):
         default=utc_now,
         nullable=False,
     )
+
+
+class ReorderPolicy(Base, TimestampMixin):
+    """Branch-specific minimum and target stock levels for a product."""
+
+    __tablename__ = "inventory_reorder_policies"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "branch_id",
+            "product_id",
+            name="uq_reorder_policy_branch_product",
+        ),
+        CheckConstraint(
+            "minimum_quantity >= 0",
+            name="ck_reorder_minimum_nonnegative",
+        ),
+        CheckConstraint(
+            "target_quantity >= minimum_quantity",
+            name="ck_reorder_target_gte_minimum",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    branch_id: Mapped[str] = mapped_column(
+        ForeignKey("branches.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    product_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    minimum_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class PurchaseRequisition(Base, TimestampMixin):
+    """A request to replenish a product at a specific branch or warehouse."""
+
+    __tablename__ = "inventory_purchase_requisitions"
+
+    __table_args__ = (
+        CheckConstraint(
+            "requested_quantity > 0",
+            name="ck_requisition_quantity_positive",
+        ),
+        CheckConstraint(
+            "status IN ('OPEN', 'APPROVED', 'ORDERED', 'CANCELLED')",
+            name="ck_requisition_status_valid",
+        ),
+        UniqueConstraint("open_key", name="uq_requisition_open_key"),
+        Index(
+            "ix_requisition_branch_product_status",
+            "branch_id",
+            "product_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    branch_id: Mapped[str] = mapped_column(
+        ForeignKey("branches.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    product_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    requested_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="OPEN"
+    )
+
+    # Set only while OPEN, to "<branch_id>:<product_id>".
+    # Clear it when approved, ordered, or cancelled.
+    open_key: Mapped[str | None] = mapped_column(String(73), nullable=True)
