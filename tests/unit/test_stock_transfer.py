@@ -315,6 +315,8 @@ def test_carrier_event_rejected_for_draft_transfer(db_session):
         )
 
     assert transfer.status == TransferStatus.DRAFT
+
+
 def test_damaged_and_missing_stock_reconciliation(db_session):
     """Damaged and missing units must be accounted for separately."""
     create_branches(db_session)
@@ -369,6 +371,7 @@ def test_damaged_and_missing_stock_reconciliation(db_session):
     assert "Damaged units: 2" in log.remarks
     assert "Missing units: 1" in log.remarks
     assert transfer.status == TransferStatus.DISPUTED
+
 
 def test_dispatch_deducts_source_and_receipt_adds_good_stock(
     db_session,
@@ -437,6 +440,7 @@ def test_dispatch_deducts_source_and_receipt_adds_good_stock(
     assert destination_batch.quantity == 4
     assert source_batch.quantity == 995
 
+
 def test_dispatch_rejects_insufficient_stock(db_session):
     create_branches(db_session)
     service = StockTransferService(db_session)
@@ -480,6 +484,166 @@ def test_dispatch_rejects_insufficient_stock(db_session):
 
     assert source_batch.quantity == 2
     assert transfer.status == TransferStatus.DRAFT
+
+
+def test_dispatch_allocates_across_rows_with_same_batch_number(db_session):
+    """Dispatch can allocate one batch across multiple stock rows."""
+    create_branches(db_session)
+
+    db_session.add(
+        StockBatch(
+            id="batch-b1-p1-extra",
+            product_id="p1",
+            branch_id="b1",
+            batch_number="BATCH-001",
+            quantity=3,
+            purchase_price=100.0,
+            selling_price=120.0,
+        )
+    )
+    db_session.commit()
+
+    service = StockTransferService(db_session)
+    transfer = service.create_transfer_request(
+        source_branch_id="b1",
+        destination_branch_id="b2",
+        items=[
+            {
+                "product_id": "p1",
+                "product_name": "Test Product",
+                "batch_number": "BATCH-001",
+                "quantity_dispatched": 1002,
+                "unit_cost": 100.0,
+            }
+        ],
+        dispatched_by="tester",
+    )
+
+    dispatched = service.dispatch_transfer(transfer.id)
+
+    remaining = (
+        db_session.query(StockBatch)
+        .filter_by(
+            branch_id="b1",
+            product_id="p1",
+            batch_number="BATCH-001",
+        )
+        .with_entities(StockBatch.quantity)
+        .all()
+    )
+
+    assert sum(quantity for (quantity,) in remaining) == 1
+    assert dispatched.items[0].batch_number == "BATCH-001"
+    assert dispatched.status == TransferStatus.DISPATCHED
+
+
+def test_dispatch_rolls_back_when_later_item_lacks_stock(db_session):
+    """A failed multi-item dispatch must not partially deduct stock."""
+    create_branches(db_session)
+
+    before = {
+        batch.id: batch.quantity
+        for batch in db_session.query(StockBatch).all()
+    }
+
+    service = StockTransferService(db_session)
+    transfer = service.create_transfer_request(
+        source_branch_id="b1",
+        destination_branch_id="b2",
+        items=[
+            {
+                "product_id": "p1",
+                "product_name": "Available Product",
+                "batch_number": "BATCH-001",
+                "quantity_dispatched": 10,
+                "unit_cost": 100.0,
+            },
+            {
+                "product_id": "p2",
+                "product_name": "Unavailable Product",
+                "batch_number": "BATCH-002",
+                "quantity_dispatched": 1,
+                "unit_cost": 40.0,
+            },
+        ],
+        dispatched_by="tester",
+    )
+
+    with pytest.raises(ValidationError):
+        service.dispatch_transfer(transfer.id)
+
+    db_session.rollback()
+    db_session.expire_all()
+
+    after = {
+        batch.id: batch.quantity
+        for batch in db_session.query(StockBatch).all()
+    }
+    refreshed_transfer = (
+        db_session.query(StockTransfer)
+        .filter_by(id=transfer.id)
+        .one()
+    )
+
+    assert after == before
+    assert refreshed_transfer.status == TransferStatus.DRAFT
+    assert refreshed_transfer.delivery_challan_number is None
+    assert refreshed_transfer.gate_pass_number is None
+
+
+def test_dispatch_rejects_unspecified_product_with_multiple_batches(db_session):
+    """Do not guess which batch to dispatch when multiple batches exist."""
+    create_branches(db_session)
+
+    db_session.add(
+        StockBatch(
+            id="batch-b1-p1-second",
+            product_id="p1",
+            branch_id="b1",
+            batch_number="BATCH-002",
+            quantity=20,
+            purchase_price=100.0,
+            selling_price=120.0,
+        )
+    )
+    db_session.commit()
+
+    service = StockTransferService(db_session)
+    transfer = service.create_transfer_request(
+        source_branch_id="b1",
+        destination_branch_id="b2",
+        items=[
+            {
+                "product_id": "p1",
+                "product_name": "Test Product",
+                "quantity_dispatched": 10,
+                "unit_cost": 100.0,
+            }
+        ],
+        dispatched_by="tester",
+    )
+
+    with pytest.raises(ValidationError, match="multiple batches"):
+        service.dispatch_transfer(transfer.id)
+
+    db_session.rollback()
+    db_session.expire_all()
+
+    source_stock = (
+        db_session.query(StockBatch)
+        .filter_by(branch_id="b1", product_id="p1")
+        .with_entities(StockBatch.quantity)
+        .all()
+    )
+    refreshed_transfer = (
+        db_session.query(StockTransfer)
+        .filter_by(id=transfer.id)
+        .one()
+    )
+
+    assert sum(quantity for (quantity,) in source_stock) == 1020
+    assert refreshed_transfer.status == TransferStatus.DRAFT
+
 
 def test_reconciliation_rejects_invalid_resolution_status(db_session):
     """Reject unsupported resolution status values."""
@@ -526,6 +690,7 @@ def test_reconciliation_rejects_invalid_resolution_status(db_session):
     db_session.refresh(transfer)
 
     assert transfer.status == TransferStatus.RECEIVED
+
 
 # ----------------------------------------------------------------------
 # Reconciliation: calculations, duplicates, statuses and approval audit

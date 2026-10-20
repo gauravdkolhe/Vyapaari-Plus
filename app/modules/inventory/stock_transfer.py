@@ -1,3 +1,4 @@
+
 import uuid
 from datetime import datetime, timezone
 
@@ -121,13 +122,26 @@ class StockTransferService:
                     "Unit cost must be a non-negative number."
                 )
 
+            batch_number = item_data.get("batch_number")
+            if batch_number is not None and (
+                not isinstance(batch_number, str)
+                or not batch_number.strip()
+            ):
+                raise ValidationError(
+                    "Batch number must be a non-empty string when provided."
+                )
+
             validated_items.append(
                 {
                     "product_id": product_id.strip(),
                     "product_name": item_data.get(
                         "product_name", "Unknown Product"
                     ),
-                    "batch_number": item_data.get("batch_number"),
+                    "batch_number": (
+                        batch_number.strip()
+                        if batch_number is not None
+                        else None
+                    ),
                     "quantity_dispatched": quantity,
                     "unit_cost": float(unit_cost),
                 }
@@ -227,43 +241,107 @@ class StockTransferService:
             raise
 
     def _deduct_source_stock(self, transfer: StockTransfer) -> None:
-        """Deduct dispatched quantities from the source branch batches."""
+        """Validate and allocate stock from locked source batches."""
+
+        batches = (
+            self.db.query(StockBatch)
+            .filter(StockBatch.branch_id == transfer.source_branch_id)
+            .order_by(
+                StockBatch.product_id,
+                StockBatch.batch_number,
+                StockBatch.id,
+            )
+            .with_for_update()
+            .all()
+        )
+
+        requirements = {}
+        item_keys = {}
+        batch_modes_by_product = {}
+
         for item in transfer.items:
-            query = self.db.query(StockBatch).filter(
-                StockBatch.branch_id == transfer.source_branch_id,
-                StockBatch.product_id == item.product_id,
+            requested_batch = item.batch_number or None
+            key = (item.product_id, requested_batch)
+
+            item_keys[item.id] = key
+            requirements[key] = requirements.get(key, 0) + (
+                item.quantity_dispatched
             )
 
-            if item.batch_number:
-                query = query.filter(
-                    StockBatch.batch_number == item.batch_number
-                )
-
-            batches = query.all()
-
-            # If no batch was specified, choose one batch that can
-            # satisfy the complete item quantity.
-            batch = next(
-                (
-                    candidate
-                    for candidate in batches
-                    if candidate.quantity >= item.quantity_dispatched
-                ),
-                None,
+            modes = batch_modes_by_product.setdefault(
+                item.product_id, set()
             )
+            modes.add(requested_batch is None)
 
-            if batch is None:
+        # Avoid overlapping reservations for specified and unspecified batches.
+        for product_id, modes in batch_modes_by_product.items():
+            if len(modes) > 1:
                 raise ValidationError(
-                    f"Insufficient stock for product {item.product_id}. "
-                    f"Required: {item.quantity_dispatched}; "
-                    f"available in matching batches: "
-                    f"{sum(candidate.quantity for candidate in batches)}."
+                    f"Product {product_id} has both specified and "
+                    "unspecified batch items. Specify a batch number "
+                    "for every item of this product."
                 )
 
-            # Persist the selected batch on the transfer item so the
-            # receiving branch can use the same batch number.
-            item.batch_number = batch.batch_number
-            batch.quantity -= item.quantity_dispatched
+        candidates_by_key = {}
+
+        # Validate every requirement before mutating any stock.
+        for (product_id, requested_batch), required in requirements.items():
+            candidates = [
+                batch
+                for batch in batches
+                if batch.product_id == product_id
+                and (
+                    requested_batch is None
+                    or batch.batch_number == requested_batch
+                )
+            ]
+
+            available = sum(batch.quantity for batch in candidates)
+
+            if available < required:
+                raise ValidationError(
+                    f"Insufficient stock for product {product_id}. "
+                    f"Required: {required}; available: {available}."
+                )
+
+            batch_numbers = {batch.batch_number for batch in candidates}
+
+            # One TransferItem stores only one batch number.
+            if requested_batch is None and len(batch_numbers) > 1:
+                raise ValidationError(
+                    f"Product {product_id} has stock in multiple batches. "
+                    "Specify a batch number for the transfer item."
+                )
+
+            if not candidates:
+                raise ValidationError(
+                    f"Insufficient stock for product {product_id}. "
+                    f"Required: {required}; available: 0."
+                )
+
+            candidates_by_key[(product_id, requested_batch)] = candidates
+
+        # All stock requirements have been validated. Deduct quantities.
+        for item in transfer.items:
+            key = item_keys[item.id]
+            candidates = candidates_by_key[key]
+            remaining = item.quantity_dispatched
+
+            for batch in candidates:
+                if remaining <= 0:
+                    break
+
+                deducted = min(batch.quantity, remaining)
+                batch.quantity -= deducted
+                remaining -= deducted
+
+            if remaining > 0:
+                raise ValidationError(
+                    f"Insufficient stock for product {item.product_id}; "
+                    f"{remaining} units could not be allocated."
+                )
+
+            item.batch_number = candidates[0].batch_number
 
     def dispatch_transfer(
         self,
