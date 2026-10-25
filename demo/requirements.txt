@@ -1,0 +1,6 @@
+streamlit
+SQLAlchemy
+pydantic
+pydantic-settings
+python-dotenv
+loguru
